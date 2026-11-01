@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# SessionStart hook: prints a short status banner so Claude knows what the
+# repository looks like at the start of a session (startup, resume, /clear and
+# after compaction — no matcher is set in settings.json so it runs for all).
+#
+# Output goes to stdout. Claude Code adds it to Claude's context.
+# Needs: git. The template update check additionally needs network access
+# (falls back to the last fetched result cached under .git/ when offline).
+
+set -euo pipefail
+
+cd "${CLAUDE_PROJECT_DIR:-.}" 2>/dev/null || exit 0
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  exit 0
+fi
+
+branch=$(git symbolic-ref --short -q HEAD 2>/dev/null || git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+# The checkout this hook ran in. When a worktree session is started while the hook is
+# resolved from another checkout (e.g. a stale main checkout), every line below — the
+# branch, and the template version compared later — describes that other checkout.
+# Printing the path lets Claude notice the mismatch (#43).
+hook_dir=$(git rev-parse --show-toplevel 2>/dev/null || echo "?")
+short_status=$(git status --short 2>/dev/null | head -n 20 || true)
+ahead_behind=$(git rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null || echo "")
+
+printf '## Repository status\n'
+printf -- '- Branch: `%s`\n' "$branch"
+printf -- '- Checkout: `%s` (where this hook ran; if it differs from the session working directory, this banner describes another checkout)\n' "$hook_dir"
+if [[ -n "$ahead_behind" ]]; then
+  ahead=$(printf '%s' "$ahead_behind" | awk '{print $1}')
+  behind=$(printf '%s' "$ahead_behind" | awk '{print $2}')
+  printf -- '- Ahead/Behind upstream: %s / %s\n' "$ahead" "$behind"
+fi
+if [[ -n "$short_status" ]]; then
+  printf -- '- Working tree (truncated to 20 lines):\n```\n%s\n```\n' "$short_status"
+else
+  printf -- '- Working tree: clean\n'
+fi
+
+# --- Ghost worktree detection ---------------------------------------------
+# Compare the launch cwd (Claude's project directory) against the registered
+# worktree list. If the launch cwd lives under `.claude/worktrees/<name>/` but
+# is NOT a registered worktree, warn the model: edits made via that path
+# will silently land in a gitignored area.
+# Physical path: `git worktree list` and `--show-toplevel` print paths with symlinks
+# resolved, so a logical $PWD reached through a symlink (macOS /tmp) never matches (#142).
+launch_pwd=$(pwd -P)
+toplevel=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+worktree_paths=$(git worktree list --porcelain 2>/dev/null | awk '/^worktree / {print $2}')
+
+# Normalize paths for comparison:
+#   - backslash -> forward slash
+#   - lowercase (Windows is case-insensitive; Git's output and bash's $PWD differ)
+#   - strip trailing slash
+#   - convert MSYS-style "/d/foo" -> "d:/foo" so it matches Git's "D:/foo" output
+norm_path() {
+  local p
+  p=$(printf '%s' "$1" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')
+  p="${p%/}"
+  if [[ "$p" =~ ^/([a-z])(/.*|$) ]]; then
+    p="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+  fi
+  printf '%s' "$p"
+}
+n_orig=$(norm_path "$launch_pwd")
+n_top=$(norm_path "$toplevel")
+
+is_registered_worktree=0
+while IFS= read -r wt; do
+  [[ -z "$wt" ]] && continue
+  n_wt=$(norm_path "$wt")
+  if [[ "$n_orig" == "$n_wt" ]]; then
+    is_registered_worktree=1
+    break
+  fi
+done <<<"$worktree_paths"
+
+# Always show registered worktrees (so the model can cross-check).
+if [[ -n "$worktree_paths" ]]; then
+  printf '\n## Git worktrees (registered)\n'
+  while IFS= read -r wt; do
+    [[ -z "$wt" ]] && continue
+    printf -- '- `%s`\n' "$wt"
+  done <<<"$worktree_paths"
+fi
+
+# Ghost detection: cwd lives under .claude/worktrees/<name>/ but is not in the list.
+if [[ -n "$n_top" ]] \
+   && [[ "$n_orig" != "$n_top" ]] \
+   && [[ "$is_registered_worktree" -eq 0 ]] \
+   && [[ "$n_orig" == *"/.claude/worktrees/"* ]]; then
+  printf '\n## ⚠ Ghost worktree detected\n'
+  printf -- '- Launch cwd: `%s`\n' "$launch_pwd"
+  printf -- '- Main repo (git toplevel): `%s`\n' "$toplevel"
+  printf -- '- This path looks like a worktree but is **not registered** (likely a leftover after `git worktree remove`).\n'
+  printf -- '- Use the **main repo absolute path** for `Edit`/`Write` `file_path` and `gh ... --body-file <abs>` invocations. Edits to the launch cwd will land in a gitignored area and silently disappear.\n'
+  printf -- '- For git operations, prefer `git -C "%s" ...` over relying on the current shell pwd.\n' "$toplevel"
+fi
+
+# --- Template update check -------------------------------------------------
+# `.claude/template-version` holds the upstream template repo and the version
+# this project has adopted. Compare it against the newest `v*` tag on the
+# upstream repo and tell the model when a newer template release exists.
+# The latest tag is fetched on every run (`git ls-remote` takes about half a second).
+# A cache is not trusted while online: a 24h cache once hid a release made hours
+# earlier and the banner said `up to date` (#19, #61). The last fetched tag is kept
+# under .git/ only as a fallback when the fetch fails, and the banner marks it as cached.
+#
+# Versions are compared with `sort -V`, not for equality: a cache written before the
+# project adopted a newer release would otherwise report a "downgrade" (local v2.0.1 →
+# latest v2.0.0) right after `.claude/template-version` was bumped. So when offline, a cached
+# tag older than the adopted version is not used as the fallback, and a remote that is older
+# than local counts as up to date.
+version_newer() { # version_newer <a> <b>: true when tag <a> is a newer version than <b>
+  [[ "$1" != "$2" ]] || return 1
+  local top
+  # If `sort -V` is unavailable the pipeline fails and any difference counts as newer.
+  top=$(printf '%s\n%s\n' "$1" "$2" | sort -V 2>/dev/null | tail -n 1) || top="$1"
+  [[ "$top" == "$1" ]]
+}
+
+tv_file="${toplevel:-.}/.claude/template-version"
+if [[ -f "$tv_file" ]]; then
+  tv_repo=$(sed -n 's/^repo=//p' "$tv_file" | head -n 1 | tr -d '[:space:]' || true)
+  tv_local=$(sed -n 's/^version=//p' "$tv_file" | head -n 1 | tr -d '[:space:]' || true)
+  if [[ -n "$tv_repo" && -n "$tv_local" ]]; then
+    # Version adopted on the default branch (remote-tracking ref). A worktree on a branch
+    # that is merely behind the default branch would otherwise report an update the
+    # project has already taken in, and prompt for a duplicate update issue.
+    tv_default=""
+    default_ref=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    if [[ -z "$default_ref" ]] && git rev-parse -q --verify refs/remotes/origin/main >/dev/null 2>&1; then
+      default_ref=origin/main
+    fi
+    if [[ -n "$default_ref" ]]; then
+      # MSYS_NO_PATHCONV=1: Git for Windows (Git Bash / MSYS) rewrites arguments that look
+      # like path lists. `origin/main:.claude/template-version` contains both `/` and `:`,
+      # so it would become `origin\main;.claude\template-version` and `git show` would fail
+      # silently (the `|| true` below), leaving tv_default empty on every Windows session.
+      # Refs without `/` (HEAD:<path>, vX.Y.Z:<path>) are not affected. The variable is
+      # ignored everywhere else.
+      tv_default=$(MSYS_NO_PATHCONV=1 git show "$default_ref:.claude/template-version" 2>/dev/null | sed -n 's/^version=//p' | head -n 1 | tr -d '[:space:]' || true)
+    fi
+    # Newest version the project is known to have adopted (this branch or the default branch).
+    tv_known="$tv_local"
+    if [[ -n "$tv_default" ]] && version_newer "$tv_default" "$tv_local"; then
+      tv_known="$tv_default"
+    fi
+    git_dir=$(git rev-parse --git-common-dir 2>/dev/null || echo ".git")
+    cache="$git_dir/template-version-check"
+    ls_remote=(git ls-remote --tags --refs --sort=-v:refname "https://github.com/${tv_repo}.git" 'v*')
+    # `timeout --version` rather than `command -v timeout`: Git Bash on Windows also has
+    # C:\Windows\System32\timeout.exe (an unrelated wait command) on PATH, which would
+    # make the check fail silently and always report "Latest: unknown".
+    if timeout --version >/dev/null 2>&1; then
+      latest=$(timeout 8 "${ls_remote[@]}" 2>/dev/null | head -n 1 | awk -F/ '{print $NF}' || true)
+    else
+      latest=$("${ls_remote[@]}" 2>/dev/null | head -n 1 | awk -F/ '{print $NF}' || true)
+    fi
+    cached_note=""
+    if [[ -n "$latest" ]]; then
+      printf '%s\n' "$latest" >"$cache" 2>/dev/null || true
+    elif [[ -f "$cache" ]]; then
+      # Offline: fall back to the last fetched tag, unless it predates the version this
+      # project has already adopted (then it says nothing useful).
+      latest=$(tr -d '[:space:]' <"$cache" || true)
+      if [[ -n "$latest" ]] && version_newer "$tv_known" "$latest"; then
+        latest=""
+      fi
+      if [[ -n "$latest" ]]; then
+        cache_mtime=$(stat -c %Y "$cache" 2>/dev/null || stat -f %m "$cache" 2>/dev/null || echo "")
+        if [[ -n "$cache_mtime" ]]; then
+          cached_note=" (cached $(( ($(date +%s) - cache_mtime) / 3600 ))h ago; fetch failed, may miss newer releases)"
+        else
+          cached_note=" (cached; fetch failed, may miss newer releases)"
+        fi
+      fi
+    fi
+
+    printf '\n## Template version\n'
+    if [[ -z "$latest" ]]; then
+      printf -- '- Local: `%s` / Latest: unknown (offline or fetch failed) — skip the update check this session\n' "$tv_local"
+    elif [[ "$latest" == "$tv_local" ]]; then
+      printf -- '- Local: `%s` / Latest: `%s`%s — up to date\n' "$tv_local" "$latest" "$cached_note"
+    elif ! version_newer "$latest" "$tv_local"; then
+      printf -- '- Local: `%s` / Latest: `%s`%s — up to date (local is ahead of the latest release)\n' "$tv_local" "$latest" "$cached_note"
+    elif [[ "$tv_known" != "$tv_local" ]] && ! version_newer "$latest" "$tv_known"; then
+      printf -- '- Local: `%s` (this branch) / `%s`: `%s` / Latest: `%s`%s — up to date on the default branch; this branch is behind it\n' "$tv_local" "$default_ref" "$tv_default" "$latest" "$cached_note"
+      printf -- '- 更新用 Issue は起票済み。`git merge %s` でこのブランチに取り込めば、以降のセッションはテンプレートの最新の手順で動く\n' "$default_ref"
+    else
+      printf -- '- ⚠ **Template update available**: Local `%s` → Latest `%s` (`%s`)%s\n' "$tv_local" "$latest" "$tv_repo" "$cached_note"
+      printf -- '- Release notes: https://github.com/%s/releases/tag/%s\n' "$tv_repo" "$latest"
+      printf -- '- Diff: https://github.com/%s/compare/%s...%s\n' "$tv_repo" "$tv_local" "$latest"
+      if [[ "$tv_known" != "$tv_local" ]]; then
+        printf -- '- `%s` is at `%s` (this branch is behind it); the update issue should target `%s`\n' "$default_ref" "$tv_default" "$latest"
+      fi
+      printf -- '- `/issue-start` Phase 1 手順 0.5 で **一度だけ** ユーザーに更新用 Issue の起票を提案する。作業中の Issue のブランチでテンプレートを直接更新しない（1 Issue = 1 PR）\n'
+    fi
+  fi
+fi
+
+printf '\n## 行動原則リマインダー\n'
+printf -- '- 仕様・設計の分岐のように「ユーザーが決めること」は質問し、コードや環境のように「調べれば分かること」は自分で調べる\n'
+printf -- '- 探索・実装の節目で、把握したことと次の一手を 2〜3 行で共有する（回答を待って止まるのは Phase の確認ポイントだけ）\n'
+printf -- '- 完了を報告する前にテスト・リント・動作確認で検証し、検証できなかった項目は明記する\n'
+
+exit 0
