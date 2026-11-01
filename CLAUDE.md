@@ -1,7 +1,7 @@
 # issue-driven-dev-sandbox
 
 <!-- TODO: プロジェクトの1〜2行説明に置き換える -->
-issue-driven-dev-starter の定期ルーティン（daily-triage・weekly）を確かめるための検証用リポジトリ。アプリのコードは無い。
+issue-driven-dev-starter の定期ルーティン（daily-triage・weekly・weekday-issue-start）を確かめるための検証用リポジトリ。アプリのコードは無い。
 
 ## 開発方針
 
